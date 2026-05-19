@@ -1,7 +1,6 @@
 node_modules/
 .pnpm-store/
 pnpm-store/
-dist/
 *.tsbuildinfo
 .env
 .env.*
@@ -9,29 +8,3 @@ dist/
 coverage/
 *.log
 .DS_Store
-docs/.vitepress/cache/
-docs/.vitepress/dist/
-docs/.vitepress/.temp/
-/memory/
-/history/
-/workspaces/
-# Optional local pnpm config (e.g. store-dir); do not commit
-.npmrc
-/.worktrees/
-.massgen/
-# Local fixtures/data should never be committed in SDK branch
-/fixtures/
-/user-agents/
-ngrok.yml
-dev_docs/
-
-# IDE / Editor
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-# Claude Code
-.claude/
-CLAUDE.md
-AGENTS.md

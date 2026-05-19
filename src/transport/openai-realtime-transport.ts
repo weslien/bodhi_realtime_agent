@@ -44,23 +44,14 @@ export interface OpenAIRealtimeConfig {
 	turnDetection?: Record<string, unknown>;
 	/** Noise reduction configuration. */
 	noiseReduction?: Record<string, unknown>;
-<<<<<<< Updated upstream
-=======
 	/**
-	 * OpenAI Realtime API protocol version. Default 'ga' uses the August 2025 GA
-	 * shape (`session.type='realtime'`, nested `audio.input`/`audio.output`,
+	 * Realtime API protocol version. Default 'ga' uses the Aug 2025 GA shape
+	 * (`type='realtime'`, nested `audio.input`/`audio.output`,
 	 * `response.output_audio.delta`). Set 'legacy' for Azure OpenAI realtime
-	 * preview deployments — they still expect the flat pre-GA shape
-	 * (`input_audio_format`/`output_audio_format` at the top level,
-	 * `response.audio.delta`).
-	 *
-	 * Tested on Azure `qhub-sweden.services.ai.azure.com` with api-version
-	 * `2025-04-01-preview` and `2024-10-01-preview`, deployment
-	 * `gpt-realtime-mini` — both versions reject the GA shape with
-	 * "Unknown parameter: 'session.type'" and accept the legacy shape.
+	 * preview endpoints — they still expect the pre-GA flat shape and emit
+	 * legacy event names like `response.audio.delta`.
 	 */
 	protocolVersion?: 'ga' | 'legacy';
->>>>>>> Stashed changes
 }
 
 /** Convert a framework ToolDefinition to OpenAI function tool format. */
@@ -502,16 +493,9 @@ export class OpenAIRealtimeTransport implements LLMTransport {
 	}
 
 	private buildSessionConfig(): RealtimeSessionCreateRequest {
-<<<<<<< Updated upstream
-=======
-		// Azure OpenAI realtime preview rejects the GA `session.type='realtime'`
-		// + nested-audio shape; it still expects the flat pre-GA shape. Branch
-		// at build time so we can route a single transport at either endpoint.
 		if (this.config.protocolVersion === 'legacy') {
 			return this.buildLegacySessionConfig();
 		}
-
->>>>>>> Stashed changes
 		const session: RealtimeSessionCreateRequest = {
 			type: 'realtime',
 			output_modalities: this._textMode ? ['text'] : ['audio'],
@@ -559,17 +543,13 @@ export class OpenAIRealtimeTransport implements LLMTransport {
 		return session;
 	}
 
-<<<<<<< Updated upstream
-=======
 	/**
-	 * Pre-GA / legacy session shape used by Azure OpenAI realtime preview
-	 * endpoints (and OpenAI realtime ≤ Q2 2025). Returns the flat structure
-	 * with `input_audio_format` / `output_audio_format` at the top level and
-	 * `turn_detection` / `input_audio_transcription` as siblings (not nested
-	 * under `audio.input`). The SDK's `RealtimeSessionCreateRequest` type
-	 * models the GA shape — we cast through `Record<string, unknown>` because
-	 * Azure's preview rejects type='realtime' even when validated against the
-	 * SDK's typing. Audio events also use legacy names — see wireEventListeners().
+	 * Pre-GA / legacy session shape for Azure realtime preview endpoints.
+	 * Flat structure: `input_audio_format`/`output_audio_format` at top
+	 * level, `voice`/`turn_detection`/`input_audio_transcription` as siblings.
+	 * Cast through `Record<string, unknown>` because the SDK's typed
+	 * `RealtimeSessionCreateRequest` models GA only, and Azure rejects
+	 * `type='realtime'` even when the SDK type passes locally.
 	 */
 	private buildLegacySessionConfig(): RealtimeSessionCreateRequest {
 		const session: Record<string, unknown> = {
@@ -604,39 +584,21 @@ export class OpenAIRealtimeTransport implements LLMTransport {
 		return session as unknown as RealtimeSessionCreateRequest;
 	}
 
->>>>>>> Stashed changes
 	private wireEventListeners(): void {
 		if (!this.rt) return;
 		const rt = this.rt;
 
-<<<<<<< Updated upstream
-		// --- Audio output ---
-		rt.on('response.output_audio.delta', (event) => {
-			if (this._suppressAudio) return;
-			if (this.onAudioOutput) this.onAudioOutput(event.delta);
-
-			// Track audio duration for interruption handling
-			const bytes = Buffer.from(event.delta, 'base64').length;
-			const samples = bytes / 2; // 16-bit = 2 bytes per sample
-			this.audioOutputMs += (samples / 24000) * 1000;
-		});
-=======
-		// Audio-output handler — shared between GA and legacy. Legacy Azure
-		// emits `response.audio.delta`; GA OpenAI emits
-		// `response.output_audio.delta`. Same payload shape (`{delta: base64}`),
-		// so we register both names and the SDK's typed handler is one of them.
+		// --- Audio output (GA: response.output_audio.delta, legacy: response.audio.delta) ---
 		const handleAudioDelta = (event: { delta: string }) => {
 			if (this._suppressAudio) return;
 			if (this.onAudioOutput) this.onAudioOutput(event.delta);
 			const bytes = Buffer.from(event.delta, 'base64').length;
-			const samples = bytes / 2; // 16-bit PCM → 2 bytes/sample
+			const samples = bytes / 2; // 16-bit PCM
 			this.audioOutputMs += (samples / 24000) * 1000;
 		};
 		rt.on('response.output_audio.delta', handleAudioDelta);
-		// Legacy alias — Azure realtime preview emits this name.
-		// biome-ignore lint/suspicious/noExplicitAny: legacy event name not in SDK's GA-typed listener union
+		// biome-ignore lint/suspicious/noExplicitAny: legacy event name not in SDK union
 		(rt as any).on('response.audio.delta', handleAudioDelta);
->>>>>>> Stashed changes
 
 		// --- Text output (text mode — for TTS) ---
 		// biome-ignore lint/suspicious/noExplicitAny: event name may not be in SDK types yet
@@ -770,20 +732,13 @@ export class OpenAIRealtimeTransport implements LLMTransport {
 			if (tu && this.onRealtimeLLMUsage) this.onRealtimeLLMUsage(tu);
 		});
 
-		// --- Output transcription (streaming deltas) ---
-<<<<<<< Updated upstream
-		rt.on('response.output_audio_transcript.delta', (event) => {
-			if (this.onOutputTranscription) this.onOutputTranscription(event.delta);
-		});
-=======
+		// --- Output transcription (GA + legacy alias) ---
 		const handleOutputTranscript = (event: { delta: string }) => {
 			if (this.onOutputTranscription) this.onOutputTranscription(event.delta);
 		};
 		rt.on('response.output_audio_transcript.delta', handleOutputTranscript);
-		// Legacy alias — Azure realtime preview emits this name.
-		// biome-ignore lint/suspicious/noExplicitAny: legacy event name not in SDK's GA-typed listener union
+		// biome-ignore lint/suspicious/noExplicitAny: legacy event name not in SDK union
 		(rt as any).on('response.audio_transcript.delta', handleOutputTranscript);
->>>>>>> Stashed changes
 
 		// NOTE: session.created is handled in connect() to control startup ordering.
 		// onSessionReady fires at the end of connect() after session.updated confirms.

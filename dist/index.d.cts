@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import * as ai from 'ai';
 import { LanguageModelV1 } from 'ai';
+import { IncomingMessage, Server } from 'node:http';
+import { WebSocket } from 'ws';
 
 /** Classification categories for extracted memory facts. */
 type MemoryCategory = 'preference' | 'entity' | 'decision' | 'requirement';
@@ -180,6 +182,10 @@ interface TransportCapabilities {
     contextCompression: boolean;
     /** Provides grounding metadata with search citations (Gemini: yes, OpenAI: no). */
     groundingMetadata: boolean;
+    /** Supports text-only response modality (required for external TTS).
+     *  Optional — defaults to false. Existing custom transport implementations
+     *  are unaffected until they want to support TTS. */
+    textResponseModality?: boolean;
 }
 /** Audio format descriptor passed to an STT provider at configuration time. */
 interface STTAudioConfig {
@@ -287,6 +293,9 @@ interface LLMTransportConfig {
         input?: boolean;
         output?: boolean;
     };
+    /** Response modality. Default: 'audio' (LLM-native speech).
+     *  Set to 'text' when using an external TTSProvider. */
+    responseModality?: 'audio' | 'text';
     providerOptions?: Record<string, unknown>;
 }
 /** Authentication method for the transport. */
@@ -305,6 +314,9 @@ type TransportAuth = {
 interface SessionUpdate {
     instructions?: string;
     tools?: ToolDefinition[];
+    /** Response modality override. Used to preserve text mode across
+     *  agent transfers and reconnects when TTSProvider is configured. */
+    responseModality?: 'audio' | 'text';
     providerOptions?: Record<string, unknown>;
 }
 /** Tool call as delivered by the transport. */
@@ -360,6 +372,46 @@ interface LLMTransportError {
     error: Error;
     recoverable: boolean;
 }
+/** Which realtime provider produced this usage event. */
+type RealtimeUsageProvider = 'gemini_live' | 'openai_realtime';
+/** What billable slice this event describes. */
+type RealtimeUsageKind = 'response' | 'input_transcription';
+/** Whether this is a mid-turn snapshot or a turn-final snapshot. */
+type RealtimeUsagePhase = 'update' | 'final';
+/** Billable unit for this event (tokens vs duration-based transcription). */
+type RealtimeUsageUnit = 'tokens' | 'duration_seconds';
+/** Optional per-modality token breakdown when the provider exposes it. */
+interface RealtimeUsageModalityBreakdown {
+    inputTextTokens?: number;
+    inputAudioTokens?: number;
+    inputImageTokens?: number;
+    cachedTokens?: number;
+    cachedTextTokens?: number;
+    cachedAudioTokens?: number;
+    cachedImageTokens?: number;
+    outputTextTokens?: number;
+    outputAudioTokens?: number;
+}
+/**
+ * Normalized usage from Gemini Live or OpenAI Realtime transports.
+ * Carries provider-reported billable units only (no USD estimation).
+ */
+interface RealtimeLLMUsageEvent {
+    provider: RealtimeUsageProvider;
+    kind: RealtimeUsageKind;
+    phase: RealtimeUsagePhase;
+    unit: RealtimeUsageUnit;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    /** Present when `unit === 'duration_seconds'` (e.g. some transcription billing). */
+    durationSeconds?: number;
+    modalityBreakdown?: RealtimeUsageModalityBreakdown;
+    /** OpenAI response id when `kind === 'response'`. */
+    providerResponseId?: string;
+    /** Opaque provider payload for exact downstream reconciliation. */
+    providerRaw?: unknown;
+}
 /**
  * Provider-agnostic interface for realtime LLM transports.
  *
@@ -396,9 +448,24 @@ interface LLMTransport {
     /** Fires when the model begins any response (audio, tool call, etc.).
      *  Used by VoiceSession to trigger STT provider commit. */
     onModelTurnStart?: () => void;
+    /** Fires when the model produces text output (text-mode responses).
+     *  Only active when responseModality is 'text' (i.e., external TTS in use).
+     *  @param text Incremental text chunk (may be partial word/sentence) */
+    onTextOutput?: (text: string) => void;
+    /** Fires when the model's text response is complete for this turn.
+     *  Signals that all text for the current response has been delivered.
+     *  Ordering contract: fires after all onTextOutput, before onTurnComplete. */
+    onTextDone?: () => void;
+    /** Fires when the transport detects user speech via VAD.
+     *  Used for TTS-level barge-in when the LLM is idle but TTS is still playing.
+     *  OpenAI: wired to input_audio_buffer.speech_started.
+     *  Gemini: may require custom VAD signal — needs empirical testing. */
+    onSpeechStarted?: () => void;
     onGoAway?: (timeLeft: string) => void;
     onResumptionUpdate?: (handle: string, resumable: boolean) => void;
     onGroundingMetadata?: (metadata: Record<string, unknown>) => void;
+    /** Optional: fires when the provider reports token or duration usage for billing/observability. */
+    onRealtimeLLMUsage?: (usage: RealtimeLLMUsageEvent) => void;
 }
 
 /**
@@ -429,6 +496,12 @@ declare class ConversationContext {
     getItemsSinceCheckpoint(): ConversationItem[];
     /** Advance the checkpoint cursor to the current end of the items list. */
     markCheckpoint(): void;
+    /**
+     * Load existing items (e.g. when resuming from persisted history).
+     * Appends to the timeline and advances the checkpoint so these items are not
+     * re-flushed by ConversationHistoryWriter.
+     */
+    loadItems(items: ConversationItem[]): void;
     /** Store a compressed summary and evict all items before the current checkpoint. */
     setSummary(summary: string): void;
     /** Build a snapshot of conversation state for a subagent (summary + recent turns + memory). */
@@ -497,11 +570,27 @@ interface FrameworkHooks {
         toolCalls: string[];
         tokensUsed: number;
     }): void;
+    /** Fires when a realtime LLM transport reports provider usage (tokens or duration). */
+    onRealtimeLLMUsage?(event: {
+        sessionId: string;
+        agentName: string;
+        usage: RealtimeLLMUsageEvent;
+    }): void;
     /** Fires after the memory distiller extracts facts from conversation. */
     onMemoryExtraction?(event: {
         userId: string;
         factsExtracted: number;
         durationMs: number;
+    }): void;
+    /** Fires after each TTS synthesis request completes. */
+    onTTSSynthesis?(event: {
+        sessionId: string;
+        provider: string;
+        textLength: number;
+        durationMs: number;
+        audioMs: number;
+        ttfbMs: number;
+        requestId: number;
     }): void;
     /** Fires on any framework error. Use for centralized error logging/alerting. */
     onError?(event: {
@@ -567,10 +656,24 @@ declare class HooksManager {
         toolCalls: string[];
         tokensUsed: number;
     }) => void) | undefined;
+    get onRealtimeLLMUsage(): ((event: {
+        sessionId: string;
+        agentName: string;
+        usage: RealtimeLLMUsageEvent;
+    }) => void) | undefined;
     get onMemoryExtraction(): ((event: {
         userId: string;
         factsExtracted: number;
         durationMs: number;
+    }) => void) | undefined;
+    get onTTSSynthesis(): ((event: {
+        sessionId: string;
+        provider: string;
+        textLength: number;
+        durationMs: number;
+        audioMs: number;
+        ttfbMs: number;
+        requestId: number;
     }) => void) | undefined;
     get onError(): ((event: {
         sessionId?: string;
@@ -595,6 +698,17 @@ interface AgentContext {
     getRecentTurns(count?: number): ConversationItem[];
     /** Retrieve all memory facts currently stored for this user. */
     getMemoryFacts(): MemoryFact[];
+    /** Request an asynchronous transfer to another agent (fires on next tick to avoid re-entrancy). */
+    requestTransfer(toAgent: string): void;
+    /** Stop buffering client audio and drain buffered chunks through the handler.
+     *  Used by external audio agents (e.g., Twilio) to flush audio accumulated during the dial gap. */
+    stopBufferingAndDrain(handler: (chunk: Buffer) => void): void;
+    /** Send a JSON message to the connected client. */
+    sendJsonToClient(message: Record<string, unknown>): void;
+    /** Send raw PCM audio to the connected client as a binary frame. */
+    sendAudioToClient?(data: Buffer): void;
+    /** Register/unregister an external audio handler for client mic frames. */
+    setExternalAudioHandler?(handler: ((data: Buffer) => void) | null): void;
 }
 /**
  * Defines a top-level voice agent that Gemini interacts with directly.
@@ -615,6 +729,8 @@ interface MainAgent {
     providerOptions?: Record<string, unknown>;
     /** IETF BCP 47 language tag for this agent (e.g., 'zh-CN', 'es-ES', 'ja-JP'). When set, a language directive is prepended to the system instruction. */
     language?: string;
+    /** Audio routing mode. 'llm' (default): audio flows through LLM transport. 'external': agent manages its own audio path (e.g., Twilio phone bridge). When 'external', LLM transport is disconnected during this agent's turn. */
+    audioMode?: 'llm' | 'external';
     /** Called when this agent becomes the active agent (after a transfer or initial start). */
     onEnter?(ctx: AgentContext): Promise<void>;
     /** Called when this agent is being replaced by another agent. */
@@ -640,8 +756,11 @@ interface SubagentConfig {
     maxSteps?: number;
     /** Timeout in milliseconds for the entire subagent run. */
     timeout?: number;
-    /** Override the model used for this subagent (defaults to session model). */
-    model?: string;
+    /**
+     * Optional Vercel AI SDK text model for this subagent’s `generateText` relay.
+     * When omitted, the session default (`VoiceSessionConfig.model`) is used.
+     */
+    reasoningModel?: LanguageModelV1;
     /** When true, a SubagentSession with user interaction capabilities is created. */
     interactive?: boolean;
     /**
@@ -700,6 +819,11 @@ declare function createAgentContext(options: {
     conversationContext: ConversationContext;
     hooks: HooksManager;
     memoryFacts?: MemoryFact[];
+    requestTransfer?: (toAgent: string) => void;
+    stopBufferingAndDrain?: (handler: (chunk: Buffer) => void) => void;
+    sendJsonToClient?: (message: Record<string, unknown>) => void;
+    sendAudioToClient?: (data: Buffer) => void;
+    setExternalAudioHandler?: (handler: ((data: Buffer) => void) | null) => void;
 }): AgentContext;
 
 /**
@@ -839,6 +963,10 @@ interface EventPayloadMap {
         fromAgent: string;
         toAgent: string;
     };
+    'agent.transfer_requested': {
+        sessionId: string;
+        toAgent: string;
+    };
     'agent.handoff': {
         sessionId: string;
         agentName: string;
@@ -966,57 +1094,28 @@ declare class SessionManager {
     get isActive(): boolean;
     get isDisconnected(): boolean;
     get resumptionHandle(): string | null;
-    /** Reset to CREATED state — allows a fresh session after CLOSED. */
-    reset(): void;
     transitionTo(newState: SessionState): void;
     updateResumptionHandle(handle: string): void;
     bufferMessage(message: ClientMessage): void;
     drainBufferedMessages(): ClientMessage[];
 }
 
-/** Callbacks fired by ClientTransport when client events occur. */
-interface ClientTransportCallbacks {
-    /** Raw PCM audio data received from the client WebSocket (binary frames). */
-    onAudioFromClient?(data: Buffer): void;
-    /** A JSON message received from the client WebSocket (text frames). */
-    onJsonFromClient?(message: Record<string, unknown>): void;
-    /** A client WebSocket connection was established. */
-    onClientConnected?(): void;
-    /** The client WebSocket disconnected. */
-    onClientDisconnected?(): void;
-    /** An image was uploaded by the client (base64-encoded). */
-    onImageUpload?(imageBase64: string, mimeType: string): void;
-}
 /**
- * WebSocket server that bridges a client audio app to the framework.
- *
- * Multiplexes two message types on the same WebSocket connection:
- * - **Binary frames**: Raw PCM audio (forwarded via `onAudioFromClient` or buffered during transfers).
- * - **Text frames**: JSON messages for GUI events (`onJsonFromClient`).
- *
- * Buffering mode (`startBuffering`/`stopBuffering`) only affects binary audio frames.
- * Text frames are always delivered immediately.
+ * Contract for sending data to one client. The server owns the socket and implements this;
+ * VoiceSession sends audio and JSON through it. Input is fed via feedAudioFromClient / feedJsonFromClient.
  */
-declare class ClientTransport {
-    private port;
-    private callbacks;
-    private host;
-    private listenTimeoutMs;
-    private wss;
-    private client;
-    private audioBuffer;
-    private _buffering;
-    constructor(port: number, callbacks: ClientTransportCallbacks, host?: string, listenTimeoutMs?: number);
+interface SessionClientSender {
+    sendAudio(data: Buffer): void;
+    sendJson(message: Record<string, unknown>): void;
+}
+/** Internal channel used by VoiceSession (send + buffering). Implemented by ClientSenderAdapter. */
+interface IClientChannel {
     start(): Promise<void>;
     stop(): Promise<void>;
-    /** Send raw PCM audio to the client as a binary frame. */
     sendAudioToClient(data: Buffer): void;
-    /** Send a JSON message to the client as a text frame. */
     sendJsonToClient(message: Record<string, unknown>): void;
     startBuffering(): void;
     stopBuffering(): Buffer[];
-    get isClientConnected(): boolean;
-    get buffering(): boolean;
 }
 
 /** Severity level for framework errors, used by the onError hook. */
@@ -1178,6 +1277,13 @@ interface SubagentEventCallbacks {
     /** Fired when a subagent session transitions to a terminal state (completed/cancelled). */
     onSessionEnd?: (toolCallId: string) => void;
 }
+/** Hooks for bridging external-audio agents with VoiceSession audio routing. */
+interface ExternalAudioCallbacks {
+    /** Called when an external agent wants to receive raw client mic audio. */
+    setExternalAudioHandler?: (handler: ((data: Buffer) => void) | null) => void;
+    /** Called when an external agent wants to play raw PCM audio to the client. */
+    sendAudioToClient?: (data: Buffer) => void;
+}
 /**
  * Manages agent lifecycle: transfers between MainAgents and handoffs to background subagents.
  *
@@ -1201,10 +1307,13 @@ declare class AgentRouter {
     private getInstructionSuffix?;
     private extraTools;
     private subagentCallbacks?;
+    private externalAudioCallbacks?;
     private agents;
     private _activeAgent;
     private activeSubagents;
-    constructor(sessionManager: SessionManager, eventBus: IEventBus, hooks: HooksManager, conversationContext: ConversationContext, transport: LLMTransport, clientTransport: ClientTransport, model: LanguageModelV1, getInstructionSuffix?: (() => string) | undefined, extraTools?: ToolDefinition[], subagentCallbacks?: SubagentEventCallbacks | undefined);
+    /** Response modality to include in transfer SessionUpdate (set by VoiceSession for TTS). */
+    responseModality?: 'audio' | 'text';
+    constructor(sessionManager: SessionManager, eventBus: IEventBus, hooks: HooksManager, conversationContext: ConversationContext, transport: LLMTransport, clientTransport: IClientChannel, model: LanguageModelV1, getInstructionSuffix?: (() => string) | undefined, extraTools?: ToolDefinition[], subagentCallbacks?: SubagentEventCallbacks | undefined, externalAudioCallbacks?: ExternalAudioCallbacks | undefined);
     registerAgents(agents: MainAgent[]): void;
     setInitialAgent(agentName: string): void;
     get activeAgent(): MainAgent;
@@ -1218,8 +1327,10 @@ declare class AgentRouter {
     getSubagentSession(toolCallId: string): SubagentSession | null;
     /** Find the SubagentSession that has a pending UI request with the given requestId. */
     findSessionByRequestId(requestId: string): SubagentSession | null;
-    /** Spawn a background subagent to handle a tool call asynchronously. */
-    handoff(toolCall: ToolCall, subagentConfig: SubagentConfig): Promise<SubagentResult>;
+    /**
+     * Spawn a background subagent to handle a tool call asynchronously.
+     */
+    handoff(toolCall: ToolCall, subagentConfig: SubagentConfig, externalSignal?: AbortSignal): Promise<SubagentResult>;
     /** Abort a running background subagent by its originating tool call ID. */
     cancelSubagent(toolCallId: string): void;
     get activeSubagentCount(): number;
@@ -1323,8 +1434,6 @@ type QueuePriority = 'normal' | 'high';
 interface SendOrQueueOptions {
     /** Delivery priority. 'high' attempts immediate delivery or front-of-queue. Default: 'normal'. */
     priority?: QueuePriority;
-    /** Tool call ID for deduplication. If provided, prevents duplicate notifications for the same tool call. */
-    toolCallId?: string;
 }
 /**
  * Queues background tool completion notifications when the LLM is actively
@@ -1344,8 +1453,6 @@ declare class BackgroundNotificationQueue {
     private queue;
     private audioReceived;
     private interrupted;
-    /** Track tool calls that have already been notified to prevent duplicates. */
-    private sentNotifications;
     constructor(sendContent: (turns: Turn[], turnComplete: boolean) => void, log: (msg: string) => void, messageTruncation?: boolean);
     /**
      * Send a notification immediately if the model is idle, or queue it if
@@ -1354,10 +1461,6 @@ declare class BackgroundNotificationQueue {
      * High-priority messages attempt immediate delivery when the transport
      * supports message truncation (OpenAI). On non-truncation transports (Gemini),
      * high-priority messages are queued at the front of the queue.
-     *
-     * Deduplication: If a toolCallId is provided and has already been notified,
-     * the notification is silently skipped to prevent race conditions where a
-     * background task completes synchronously before audio generation begins.
      */
     sendOrQueue(turns: Turn[], turnComplete: boolean, options?: SendOrQueueOptions): void;
     /** Mark that the first audio chunk has been received this turn. */
@@ -1615,6 +1718,454 @@ declare class MemoryCacheManager {
     get facts(): MemoryFact[];
 }
 
+/** A single preset within a behavior category. */
+interface BehaviorPreset {
+    /** Machine-readable preset name (enum value in tool schema). */
+    name: string;
+    /** Human-readable label for client UI display. */
+    label: string;
+    /** Directive text injected into model context. null = clear directive. */
+    directive: string | null;
+}
+/** Declares a tunable behavior with discrete presets. */
+interface BehaviorCategory {
+    /** Unique category key — becomes the directive key (e.g. "pacing"). */
+    key: string;
+    /** Tool name auto-generated for the LLM (e.g. "set_pacing"). */
+    toolName: string;
+    /** Tool description shown to the LLM for tool selection. */
+    toolDescription: string;
+    /** Ordered presets. First preset is the default. */
+    presets: BehaviorPreset[];
+    /** Directive scope. 'session' (default) persists across agent transfers. */
+    scope?: 'session' | 'agent';
+}
+
+/**
+ * Audio format descriptor for TTS output.
+ * Returned by TTSProvider.configure() to indicate the actual output format.
+ */
+interface TTSAudioConfig {
+    /** Sample rate in Hz (e.g. 24000 for ElevenLabs, 44100 for Cartesia). */
+    sampleRate: number;
+    /** Bits per sample (16). */
+    bitDepth: number;
+    /** Number of channels (1 = mono). */
+    channels: number;
+    /** Encoding format. */
+    encoding: 'pcm';
+}
+/**
+ * Provider-agnostic interface for pluggable text-to-speech providers.
+ *
+ * VoiceSession creates the provider, calls configure() with the preferred
+ * output format, then start(). Text flows in via synthesize() with a
+ * requestId for turn correlation; audio chunks flow out via onAudio callback
+ * tagged with the same requestId. The provider handles streaming, buffering,
+ * and chunked delivery internally.
+ *
+ */
+interface TTSProvider {
+    /** Called once before start(). Provider receives the preferred output format
+     *  (derived from the transport's outputSampleRate) and returns the actual
+     *  format it will produce. If the provider can emit at the preferred rate
+     *  natively, it SHOULD do so to avoid resampling overhead.
+     *
+     *  @param preferred The ideal output format (sampleRate, bitDepth, channels)
+     *  @returns The actual output format the provider will produce */
+    configure(preferred: TTSAudioConfig): TTSAudioConfig;
+    /** Open connection (WebSocket for streaming providers). */
+    start(): Promise<void>;
+    /** Close connection and release resources. */
+    stop(): Promise<void>;
+    /** Synthesize text into speech. Called with text chunks as they arrive
+     *  from the LLM. The provider decides internally whether to buffer for
+     *  sentence boundaries or stream immediately.
+     *
+     *  @param text Partial or complete text from LLM response
+     *  @param requestId Monotonic ID correlating this text to a specific turn/response.
+     *                   All onAudio/onDone callbacks for this text MUST carry the same requestId.
+     *  @param options.flush If true, flush any buffered text to TTS now (does NOT mean end-of-request). */
+    synthesize(text: string, requestId: number, options?: {
+        flush?: boolean;
+    }): void;
+    /** Cancel any in-progress synthesis (best-effort). Called when the user
+     *  interrupts (barge-in). Provider SHOULD stop generating audio as quickly
+     *  as possible and clear internal buffers. Late-arriving audio chunks after
+     *  cancel() are safe — VoiceSession filters them via requestId. */
+    cancel(): void;
+    /** Audio chunk ready for delivery to client.
+     *  @param base64Pcm Base64-encoded PCM audio chunk
+     *  @param durationMs Duration of this chunk in milliseconds
+     *  @param requestId The requestId from the synthesize() call that produced this audio */
+    onAudio?: (base64Pcm: string, durationMs: number, requestId: number) => void;
+    /** Synthesis completed for a request.
+     *  Fired after the final audio chunk for the given requestId.
+     *  VoiceSession uses this to gate turn completion.
+     *  @param requestId The requestId that has completed synthesis */
+    onDone?: (requestId: number) => void;
+    /** Word-level timing for caption synchronization (optional).
+     *  Providers that support word timestamps (Cartesia, ElevenLabs) fire this
+     *  for real-time caption alignment on the client.
+     *  NOTE: This is for timing metadata only, NOT for output transcription.
+     *  @param word The spoken word
+     *  @param offsetMs Offset from the start of synthesis for this requestId, in milliseconds
+     *  @param requestId The requestId this word belongs to */
+    onWordBoundary?: (word: string, offsetMs: number, requestId: number) => void;
+    /** Error during synthesis. Non-fatal errors are logged;
+     *  fatal errors trigger session close (fail-fast in V1). */
+    onError?: (error: Error, fatal: boolean) => void;
+}
+
+/** Parameters for saving an artifact produced by an agent or tool. */
+interface SaveArtifactParams {
+    /** Session that produced the artifact (injected by session.workspace when omitted). */
+    sessionId?: string;
+    /** User context (injected by session.workspace when omitted). */
+    userId?: string;
+    /** Name of the agent that produced the artifact. */
+    agentName?: string;
+    /** Tool call that produced the artifact (for correlation). */
+    toolCallId?: string;
+    /** MIME type (e.g. image/png, application/pdf). */
+    mimeType: string;
+    /** Raw bytes. */
+    content: Buffer | Uint8Array;
+    /** Optional metadata (filename, dimensions, etc.). */
+    metadata?: Record<string, unknown>;
+}
+/** Reference returned after saving an artifact; may include a URL for serving. */
+interface ArtifactRef {
+    /** Opaque identifier (store- or app-generated). */
+    id: string;
+    /** Session that owns the artifact. */
+    sessionId: string;
+    /** Optional URL for direct access (if the store provides one). */
+    url?: string;
+    /** MIME type. */
+    mimeType: string;
+    /** Optional metadata. */
+    metadata?: Record<string, unknown>;
+}
+/**
+ * Persistence interface for artifacts produced by agents/subagents (images, videos, docs, etc.).
+ * Implementations are provided by the app (e.g. S3, GCS, local FS); framework only calls this interface.
+ */
+interface ArtifactStore {
+    /** Persist an artifact; returns a reference (id, optional url). */
+    saveArtifact(params: SaveArtifactParams): Promise<ArtifactRef>;
+}
+
+/**
+ * Configuration for creating a VoiceSession.
+ */
+interface VoiceSessionConfig {
+    /** Unique session identifier. */
+    sessionId: string;
+    /** User identifier (used for memory storage and history). */
+    userId: string;
+    /** Google API key for the Gemini Live API (used when no transport is provided). */
+    apiKey: string;
+    /** All agents available in this session. */
+    agents: MainAgent[];
+    /** Name of the agent to activate on start. */
+    initialAgent: string;
+    /** Background subagent configs keyed by tool name. */
+    subagentConfigs?: Record<string, SubagentConfig>;
+    /** Lifecycle hooks for observability. */
+    hooks?: FrameworkHooks;
+    /**
+     * Sender for all output to the client. The server owns the socket and feeds input
+     * via feedAudioFromClient / feedJsonFromClient and notifyClientConnected / notifyClientDisconnected.
+     */
+    clientSender?: SessionClientSender;
+    /** Port for the local client WebSocket server (legacy/local mode). */
+    port?: number;
+    /** Host for the local client WebSocket server (legacy/local mode). */
+    host?: string;
+    /** Listen timeout for local client WebSocket server startup (legacy/local mode). */
+    listenTimeoutMs?: number;
+    /** LLM model name (e.g. "gemini-live-2.5-flash-preview"). */
+    geminiModel?: string;
+    /** Vercel AI SDK model for subagent text generation. */
+    model: LanguageModelV1;
+    /** Voice configuration for Gemini's speech output. */
+    speechConfig?: {
+        voiceName?: string;
+    };
+    /** Context window compression thresholds. */
+    compressionConfig?: {
+        triggerTokens: number;
+        targetTokens: number;
+    };
+    /** Enable server-side transcription of user audio input (default: true).
+     *  Has no effect when sttProvider is set (built-in is disabled automatically).
+     *  Use false to disable all input transcription for privacy or cost control. */
+    inputAudioTranscription?: boolean;
+    /** External STT provider for user input transcription.
+     *  When set, transport built-in transcription is automatically disabled.
+     *  When omitted, the transport's built-in transcription is used. */
+    sttProvider?: STTProvider;
+    /** Behavior categories for dynamic runtime tuning (speech speed, verbosity, etc.). */
+    behaviors?: BehaviorCategory[];
+    /** Enable memory distillation. Extracts durable user facts from conversation and persists them. */
+    memory?: {
+        /** Where to persist extracted facts. */
+        store: MemoryStore;
+        /** Extract every N turns (default: 5). */
+        turnFrequency?: number;
+    };
+    /** When provided, conversation items are persisted at turn boundaries and on session close. */
+    conversationHistoryStore?: ConversationHistoryStore;
+    /** When provided, agents/tools can persist artifacts (images, docs, etc.) via session.workspace.saveArtifact(). */
+    artifactStore?: ArtifactStore;
+    /** External TTS provider for speech synthesis.
+     *  When set, LLM is configured for text-mode responses.
+     *  When omitted, LLM-native audio generation is used (default). */
+    ttsProvider?: TTSProvider;
+    /** Pre-constructed LLM transport. If provided, apiKey/geminiModel/speechConfig/compressionConfig are ignored. */
+    transport?: LLMTransport;
+    /** Optional per-session artifact registry for cross-tool binary sharing (images, documents). */
+    artifactRegistry?: {
+        store(base64: string, mimeType: string, description: string, source?: string, fileName?: string): string;
+        dispose(): void;
+    };
+}
+/**
+ * Top-level integration hub that wires all framework components together.
+ *
+ * Manages the full lifecycle of a real-time voice session:
+ * - **Audio fast-path**: Client audio → LLM (and back) without touching the EventBus.
+ * - **Tool routing**: Inline tools execute synchronously; background tools hand off to subagents.
+ * - **Agent transfers**: Intercepts `transfer_to_agent` tool calls and delegates to AgentRouter.
+ * - **Reconnection**: Handles GoAway signals and unexpected disconnects via session resumption.
+ * - **Conversation tracking**: Transcriptions populate ConversationContext automatically.
+ *
+ * @example
+ * ```ts
+ * const session = new VoiceSession({
+ *   sessionId: 'session_1',
+ *   userId: 'user_1',
+ *   apiKey: process.env.GOOGLE_API_KEY,
+ *   agents: [mainAgent, expertAgent],
+ *   initialAgent: 'main',
+ *   port: 9900,
+ *   model: google('gemini-2.5-flash'),
+ * });
+ * await session.start();
+ * ```
+ */
+declare class VoiceSession {
+    readonly eventBus: EventBus;
+    readonly sessionManager: SessionManager;
+    readonly conversationContext: ConversationContext;
+    readonly hooks: HooksManager;
+    private transport;
+    private clientTransport;
+    private agentRouter;
+    private toolExecutor;
+    private toolCallRouter?;
+    private subagentConfigs;
+    private behaviorManager?;
+    private memoryDistiller?;
+    private memoryCacheManager?;
+    private turnId;
+    private sttProvider?;
+    private _commitFiredForTurn;
+    /** True when the current turn was interrupted — skips Gemini transcript correction. */
+    private _turnWasInterrupted;
+    private ttsProvider?;
+    private _ttsCurrentRequestId;
+    private _ttsTurnHasText;
+    private _ttsLlmTextDone;
+    private _ttsAudioDone;
+    private _ttsSpeaking;
+    private _ttsFormat?;
+    private _ttsIdleTimer?;
+    private _ttsHardTimer?;
+    private _ttsFirstTextMs;
+    private _ttsFirstAudioMs;
+    private _ttsTextLength;
+    private config;
+    private directiveManager;
+    private transcriptManager;
+    /** Whether a client WebSocket connection is currently active. */
+    private clientConnected;
+    private notificationQueue;
+    private interactionMode;
+    /** Tracks consecutive reconnect attempts to prevent infinite reconnect storms. */
+    private reconnectAttempts;
+    private static readonly MAX_RECONNECT_ATTEMPTS;
+    private static readonly RECONNECT_BACKOFF_MS;
+    /** Resolves when memory/directives are loaded; used so greeting is sent after load without blocking connect. */
+    private _memoryReadyPromise;
+    private externalAudioHandler;
+    constructor(config: VoiceSessionConfig);
+    /**
+     * Queue a short spoken update for the user.
+     * Delivered immediately when possible, otherwise after the current turn.
+     */
+    notifyBackground(text: string, options?: {
+        priority?: 'normal' | 'high';
+        label?: 'SUBAGENT UPDATE' | 'SUBAGENT QUESTION';
+    }): void;
+    /** Start the client WebSocket server and connect to the LLM transport. */
+    start(): Promise<void>;
+    /** Load memory cache and restore behavior directives; used in parallel with connect(). */
+    private loadMemoryAndDirectives;
+    /**
+     * Workspace API for persisting artifacts (images, videos, docs, etc.) produced by agents/tools.
+     * When no artifactStore is configured, saveArtifact returns null without persisting.
+     */
+    get workspace(): {
+        saveArtifact(params: SaveArtifactParams): Promise<ArtifactRef | null>;
+    };
+    /** Gracefully shut down: disconnect Gemini, stop the WebSocket server, transition to CLOSED. */
+    close(_reason?: string): Promise<void>;
+    /** Transfer the active session to a different agent (reconnects with new config). */
+    transfer(toAgent: string): Promise<void>;
+    private createToolExecutor;
+    private createAgentContext;
+    private handleAudioFromClient;
+    private handleAudioOutput;
+    /** Wire TTSProvider callbacks and override transport callbacks for text mode. */
+    private wireTtsProvider;
+    /** Turn gating: check if both LLM and TTS are done. */
+    private ttsMaybeCompleteTurn;
+    /** Reset the idle watchdog timer (called on each TTS audio chunk). */
+    private ttsResetIdleTimer;
+    /** Clear all TTS timers. */
+    private ttsClearTimers;
+    private handleSetupComplete;
+    /** Start STT when session becomes ACTIVE (agent ready). Fire-and-forget. */
+    private startSttProvider;
+    private handleTurnComplete;
+    /** Core turn-end logic — called directly (no TTS) or via ttsMaybeCompleteTurn (TTS gate). */
+    private handleTurnCompleteInternal;
+    /** Inject all active directives into the LLM's context to prevent behavioral drift. */
+    private reinforceDirectives;
+    /** Send the active agent's greeting prompt to the LLM to trigger a spoken greeting. */
+    private sendGreeting;
+    private handleInterrupted;
+    /** Handle a message from an interactive subagent (question, progress update). */
+    private handleSubagentMessage;
+    private handleGroundingMetadata;
+    private handleGoAway;
+    private handleResumptionUpdate;
+    private handleJsonFromClient;
+    private handleFileUpload;
+    private handleTextInput;
+    private handleClientConnected;
+    private handleClientDisconnected;
+    /** Feed client audio into the session (LLM + STT). Used when the server owns the socket (multi-user). */
+    feedAudioFromClient(data: Buffer): void;
+    /** Feed client JSON (text_input, file_upload, etc.) into the session. Used when the server owns the socket. */
+    feedJsonFromClient(message: Record<string, unknown>): void;
+    /** Notify the session that the client connected. Used when the server owns the socket (multi-user). */
+    notifyClientConnected(): void;
+    /** Notify the session that the client disconnected. Used when the server owns the socket (multi-user). */
+    notifyClientDisconnected(): void;
+    /** Session ID for logging and multi-user association. */
+    getSessionId(): string;
+    private handleTransportError;
+    private handleTransportClose;
+    private reportError;
+    /** Compact diagnostic log: HH:MM:SS.mmm [VoiceSession] message */
+    private log;
+}
+
+/**
+ * Multi-User Session Manager
+ *
+ * Manages multiple VoiceSession instances for concurrent users.
+ * Handles session lifecycle, cleanup, and resource limits.
+ */
+
+interface SessionMetadata {
+    sessionId: string;
+    userId: string;
+    createdAt: number;
+    lastActivityAt: number;
+    webSocketId?: string;
+}
+interface MultiUserSessionManagerConfig {
+    /** Maximum number of concurrent sessions per user */
+    maxSessionsPerUser?: number;
+    /** Maximum total concurrent sessions */
+    maxTotalSessions?: number;
+    /** Idle session timeout in milliseconds */
+    sessionTimeoutMs?: number;
+    /** Cleanup interval in milliseconds */
+    cleanupIntervalMs?: number;
+}
+/**
+ * Manages a pool of VoiceSession instances for multiple concurrent users.
+ */
+declare class MultiUserSessionManager {
+    private sessions;
+    private sessionMetadata;
+    private cleanupTimer;
+    private readonly config;
+    constructor(config?: MultiUserSessionManagerConfig);
+    /**
+     * Create a new VoiceSession for a user.
+     */
+    createSession(userId: string, sessionConfig: Omit<VoiceSessionConfig, 'sessionId' | 'userId'>, webSocketId?: string): Promise<VoiceSession>;
+    /**
+     * Get a session by ID.
+     */
+    getSession(sessionId: string): VoiceSession | null;
+    /**
+     * Get session metadata.
+     */
+    getSessionMetadata(sessionId: string): SessionMetadata | null;
+    /**
+     * Get all active sessions for a user.
+     */
+    getAllSessionsForUser(userId: string): VoiceSession[];
+    /**
+     * Update last activity time for a session.
+     */
+    updateActivity(sessionId: string): void;
+    /**
+     * Close and remove a session.
+     */
+    closeSession(sessionId: string, reason?: string): Promise<void>;
+    /**
+     * Close all sessions for a user.
+     */
+    closeAllSessionsForUser(userId: string, reason?: string): Promise<void>;
+    /**
+     * Get statistics about active sessions.
+     */
+    getStats(): {
+        totalSessions: number;
+        sessionsByUser: Record<string, number>;
+        oldestSession: number | null;
+        newestSession: number | null;
+    };
+    /**
+     * Get all session metadata for API.
+     */
+    getAllSessionMetadata(): SessionMetadata[];
+    /**
+     * Cleanup idle sessions.
+     */
+    cleanupIdleSessions(): Promise<number>;
+    /**
+     * Start the cleanup timer.
+     */
+    private startCleanupTimer;
+    /**
+     * Stop the cleanup timer and close all sessions.
+     */
+    shutdown(): Promise<void>;
+    /**
+     * Generate a unique session ID.
+     */
+    private generateSessionId;
+}
+
 /**
  * Executes inline tool calls requested by Gemini.
  *
@@ -1676,6 +2227,13 @@ declare class TranscriptManager {
      *  The streaming provider manages its own partial state — each partial
      *  replaces the previous one on the client. */
     handleInputPartial(text: string): void;
+    /**
+     * Replace the current input buffer with an authoritative transcript
+     * (e.g. from Gemini's built-in inputAudioTranscription).
+     * Sends a corrected partial to the client so the UI updates.
+     * No-op if the correction is empty.
+     */
+    correctInput(text: string): void;
     /** Accumulate incoming user speech transcription and emit a partial transcript. */
     handleInput(text: string): void;
     /** Accumulate incoming model speech transcription and emit a partial transcript. */
@@ -1744,175 +2302,79 @@ declare class ToolCallRouter {
     private handleBackgroundToolCall;
 }
 
-/** A single preset within a behavior category. */
-interface BehaviorPreset {
-    /** Machine-readable preset name (enum value in tool schema). */
-    name: string;
-    /** Human-readable label for client UI display. */
-    label: string;
-    /** Directive text injected into model context. null = clear directive. */
-    directive: string | null;
-}
-/** Declares a tunable behavior with discrete presets. */
-interface BehaviorCategory {
-    /** Unique category key — becomes the directive key (e.g. "pacing"). */
-    key: string;
-    /** Tool name auto-generated for the LLM (e.g. "set_pacing"). */
-    toolName: string;
-    /** Tool description shown to the LLM for tool selection. */
-    toolDescription: string;
-    /** Ordered presets. First preset is the default. */
-    presets: BehaviorPreset[];
-    /** Directive scope. 'session' (default) persists across agent transfers. */
-    scope?: 'session' | 'agent';
-}
-
 /**
- * Configuration for creating a VoiceSession.
+ * Server Configuration
+ *
+ * Configuration management for the multi-user production server.
  */
-interface VoiceSessionConfig {
-    /** Unique session identifier. */
-    sessionId: string;
-    /** User identifier (used for memory storage and history). */
-    userId: string;
-    /** Google API key for the Gemini Live API (used when no transport is provided). */
-    apiKey: string;
-    /** All agents available in this session. */
-    agents: MainAgent[];
-    /** Name of the agent to activate on start. */
-    initialAgent: string;
-    /** Background subagent configs keyed by tool name. */
-    subagentConfigs?: Record<string, SubagentConfig>;
-    /** Lifecycle hooks for observability. */
-    hooks?: FrameworkHooks;
-    /** Port for the client WebSocket server. */
+type LLMProvider = 'gemini' | 'openai';
+interface ServerConfig {
+    /** WebSocket server port */
     port: number;
-    /** Host for the client WebSocket server (default: '0.0.0.0' for all interfaces). */
-    host?: string;
-    /** LLM model name (e.g. "gemini-live-2.5-flash-preview"). */
-    geminiModel?: string;
-    /** Vercel AI SDK model for subagent text generation. */
-    model: LanguageModelV1;
-    /** Voice configuration for Gemini's speech output. */
-    speechConfig?: {
-        voiceName?: string;
+    /** WebSocket server host */
+    host: string;
+    /** Which live voice transport to use (default: gemini). */
+    llmProvider: LLMProvider;
+    /** Gemini API key (required for gemini; also used for image/video subagents when provider is openai). */
+    apiKey: string;
+    /** OpenAI API key (required when llmProvider is openai). */
+    openaiApiKey?: string;
+    /** Maximum concurrent sessions per user */
+    maxSessionsPerUser: number;
+    /** Maximum total concurrent sessions */
+    maxTotalSessions: number;
+    /** Session idle timeout in milliseconds */
+    sessionTimeoutMs: number;
+    /** Cleanup interval in milliseconds */
+    cleanupIntervalMs: number;
+    /** Authentication configuration */
+    auth: {
+        enabled: boolean;
+        method: 'api_key' | 'jwt' | 'oauth' | 'supabase' | 'anonymous';
+        apiKey?: string;
+        jwtSecret?: string;
+        supabase?: {
+            url: string;
+            anonKey: string;
+            /** Service role key for server-side Supabase client (history store, bypass RLS). */
+            serviceRoleKey?: string;
+        };
+        oauth?: {
+            clientId: string;
+            clientSecret: string;
+            tokenEndpoint: string;
+        };
     };
-    /** Context window compression thresholds. */
-    compressionConfig?: {
-        triggerTokens: number;
-        targetTokens: number;
+    /** Rate limiting configuration */
+    rateLimiting: {
+        enabled: boolean;
+        requestsPerMinute: number;
+        connectionsPerMinute: number;
     };
-    /** Enable server-side transcription of user audio input (default: true).
-     *  Has no effect when sttProvider is set (built-in is disabled automatically).
-     *  Use false to disable all input transcription for privacy or cost control. */
-    inputAudioTranscription?: boolean;
-    /** External STT provider for user input transcription.
-     *  When set, transport built-in transcription is automatically disabled.
-     *  When omitted, the transport's built-in transcription is used. */
-    sttProvider?: STTProvider;
-    /** Behavior categories for dynamic runtime tuning (speech speed, verbosity, etc.). */
-    behaviors?: BehaviorCategory[];
-    /** Enable memory distillation. Extracts durable user facts from conversation and persists them. */
-    memory?: {
-        /** Where to persist extracted facts. */
-        store: MemoryStore;
-        /** Extract every N turns (default: 5). */
-        turnFrequency?: number;
+    /** Logging configuration */
+    logging: {
+        level: 'debug' | 'info' | 'warn' | 'error';
+        format: 'json' | 'text';
     };
-    /** Pre-constructed LLM transport. If provided, apiKey/geminiModel/speechConfig/compressionConfig are ignored. */
-    transport?: LLMTransport;
+    /** Twilio inbound phone call bridge (optional — disabled when absent). */
+    twilio?: {
+        inboundEnabled: boolean;
+        /** Public HTTPS URL (nginx/ngrok) used in TwiML so Twilio connects back to us. */
+        webhookUrl: string;
+        /** Fallback agent profile for inbound calls (default: standard). */
+        defaultAgentProfile: string;
+        /** Optional E.164 number -> agent profile map (digits only key). */
+        numberAgentProfiles: Record<string, string>;
+    };
 }
 /**
- * Top-level integration hub that wires all framework components together.
- *
- * Manages the full lifecycle of a real-time voice session:
- * - **Audio fast-path**: Client audio → LLM (and back) without touching the EventBus.
- * - **Tool routing**: Inline tools execute synchronously; background tools hand off to subagents.
- * - **Agent transfers**: Intercepts `transfer_to_agent` tool calls and delegates to AgentRouter.
- * - **Reconnection**: Handles GoAway signals and unexpected disconnects via session resumption.
- * - **Conversation tracking**: Transcriptions populate ConversationContext automatically.
- *
- * @example
- * ```ts
- * const session = new VoiceSession({
- *   sessionId: 'session_1',
- *   userId: 'user_1',
- *   apiKey: process.env.GOOGLE_API_KEY,
- *   agents: [mainAgent, expertAgent],
- *   initialAgent: 'main',
- *   port: 9900,
- *   model: google('gemini-2.5-flash'),
- * });
- * await session.start();
- * ```
+ * Load server configuration from environment variables.
  */
-declare class VoiceSession {
-    readonly eventBus: EventBus;
-    readonly sessionManager: SessionManager;
-    readonly conversationContext: ConversationContext;
-    readonly hooks: HooksManager;
-    private transport;
-    private clientTransport;
-    private agentRouter;
-    private toolExecutor;
-    private toolCallRouter;
-    private subagentConfigs;
-    private behaviorManager?;
-    private memoryDistiller?;
-    private memoryCacheManager?;
-    private turnId;
-    private sttProvider?;
-    private _commitFiredForTurn;
-    private config;
-    private directiveManager;
-    private transcriptManager;
-    /** Whether a client WebSocket connection is currently active. */
-    private _clientConnected;
-    /** Whether a browser client is currently connected via WebSocket. */
-    get clientConnected(): boolean;
-    private notificationQueue;
-    private interactionMode;
-    constructor(config: VoiceSessionConfig);
-    /**
-     * Queue a short spoken update for the user.
-     * Delivered immediately when possible, otherwise after the current turn.
-     */
-    notifyBackground(text: string, options?: {
-        priority?: 'normal' | 'high';
-        label?: 'SUBAGENT UPDATE' | 'SUBAGENT QUESTION';
-    }): void;
-    /** Start the client WebSocket server and connect to the LLM transport. */
-    start(): Promise<void>;
-    /** Gracefully shut down: disconnect Gemini, stop the WebSocket server, transition to CLOSED. */
-    close(_reason?: string): Promise<void>;
-    /** Transfer the active session to a different agent (reconnects with new config). */
-    transfer(toAgent: string): Promise<void>;
-    private createToolExecutor;
-    private handleAudioFromClient;
-    private handleAudioOutput;
-    private handleSetupComplete;
-    private handleTurnComplete;
-    /** Inject all active directives into the LLM's context to prevent behavioral drift. */
-    private reinforceDirectives;
-    /** Send the active agent's greeting prompt to the LLM to trigger a spoken greeting. */
-    private sendGreeting;
-    private handleInterrupted;
-    /** Handle a message from an interactive subagent (question, progress update). */
-    private handleSubagentMessage;
-    private handleGroundingMetadata;
-    private handleGoAway;
-    private handleResumptionUpdate;
-    private handleJsonFromClient;
-    private handleFileUpload;
-    private handleTextInput;
-    private handleClientConnected;
-    private handleClientDisconnected;
-    private handleTransportError;
-    private handleTransportClose;
-    private reportError;
-    /** Compact diagnostic log: HH:MM:SS.mmm [VoiceSession] message */
-    private log;
-}
+declare function loadConfig(): ServerConfig;
+/**
+ * Validate server configuration.
+ */
+declare function validateConfig(config: ServerConfig): void;
 
 /**
  * File-based MemoryStore that persists facts and directives as a JSON file per user.
@@ -1987,6 +2449,137 @@ declare class MemoryDistiller {
     private reportError;
 }
 
+/** Decode a single mulaw byte to a 16-bit PCM sample. */
+declare function mulawDecode(mulaw: number): number;
+/** Encode a 16-bit PCM sample to a single mulaw byte. */
+declare function mulawEncode(sample: number): number;
+/**
+ * Decode a mulaw buffer to PCM L16 (16-bit signed LE).
+ * Output has 2x the byte length of input (1 mulaw byte → 2 PCM bytes).
+ */
+declare function decodeMulawToPcm(mulawBuf: Buffer): Buffer;
+/**
+ * Encode a PCM L16 buffer (16-bit signed LE) to mulaw.
+ * Output has half the byte length of input (2 PCM bytes → 1 mulaw byte).
+ */
+declare function encodePcmToMulaw(pcmBuf: Buffer): Buffer;
+/**
+ * Resample PCM L16 audio between sample rates using linear interpolation.
+ * Input and output are Buffers of 16-bit signed LE samples.
+ */
+declare function resample(pcmBuf: Buffer, fromRate: number, toRate: number): Buffer;
+/**
+ * Convert Twilio mulaw 8kHz audio to framework PCM L16 16kHz.
+ * Input: base64-encoded mulaw 8kHz buffer.
+ * Output: Buffer of PCM L16 16kHz.
+ */
+declare function twilioToFramework(mulawBase64: string): Buffer;
+/**
+ * Convert framework PCM audio to Twilio mulaw 8kHz.
+ * Input: Buffer of PCM L16 (or base64 string) at the given sample rate.
+ * Output: base64-encoded mulaw 8kHz buffer.
+ *
+ * @param pcmInput PCM L16 buffer or base64-encoded PCM string
+ * @param inputRate Sample rate of the input in Hz (default: 16000)
+ */
+declare function frameworkToTwilio(pcmInput: Buffer | string, inputRate?: number): string;
+
+interface TwilioBridgeConfig {
+    /** Twilio Account SID. */
+    accountSid: string;
+    /** Twilio Auth Token. */
+    authToken: string;
+    /** Twilio phone number to call FROM (your Twilio number, E.164). */
+    fromNumber: string;
+    /** Public base URL where Twilio sends webhooks (must be HTTPS in production). */
+    webhookBaseUrl: string;
+    /** Port for the webhook HTTP + Media Streams WS server. */
+    webhookPort: number;
+    /** Maximum call duration in seconds (Twilio `timeLimit`, default: 1800). */
+    maxCallDuration?: number;
+    /** Ring timeout in seconds before no-answer (Twilio `timeout`, default: 30). */
+    ringTimeout?: number;
+    /** Enable answering machine detection (default: false). */
+    machineDetection?: boolean;
+}
+interface TwilioBridgeCallbacks {
+    /** Called when Twilio connects and audio bridge is ready. */
+    onCallConnected: (callSid: string) => void;
+    /** Called when the human hangs up or call ends. */
+    onCallEnded: (callSid: string, reason: string) => void;
+    /** Called with PCM L16 16kHz audio FROM the human (ready for client). */
+    onAudioFromHuman: (pcm16kBuffer: Buffer) => void;
+    /** Called on error (call failed, network issue). */
+    onError: (error: Error) => void;
+}
+type BridgeState = 'idle' | 'dialing' | 'ringing' | 'connected' | 'ended' | 'disposed';
+declare class TwilioBridge {
+    private readonly config;
+    private readonly callbacks;
+    private client;
+    private webhookServer;
+    private state;
+    private callSid;
+    private wsAuthToken;
+    private streamSid;
+    constructor(config: TwilioBridgeConfig, callbacks: TwilioBridgeCallbacks);
+    /** Start the webhook server. Must be called before dial(). */
+    start(): Promise<void>;
+    /**
+     * Initiate an outbound call to the given phone number.
+     * @returns The Twilio CallSid.
+     */
+    dial(toNumber: string): Promise<string>;
+    /**
+     * Send PCM L16 16kHz audio TO the human via Twilio Media Streams.
+     * Converts to mulaw 8kHz before sending.
+     */
+    sendAudioToHuman(pcm16kInput: Buffer | string): void;
+    /** Hang up the active call. */
+    hangup(): Promise<void>;
+    /** Clean up all resources (webhook server, call). */
+    dispose(): Promise<void>;
+    /** Handle a Twilio status callback. */
+    handleStatusCallback(callSid: string, callStatus: string, answeredBy?: string): void;
+    /** Current bridge state (for testing/inspection). */
+    get currentState(): BridgeState;
+}
+
+interface TwilioWebhookServerConfig {
+    /** Port to listen on. */
+    port: number;
+    /** Twilio Auth Token for signature validation (future use). */
+    authToken: string;
+    /** Per-call nonce token for WS auth. */
+    wsAuthToken: string;
+    /** Called when audio media is received from the human. */
+    onMediaReceived: (base64Audio: string) => void;
+    /** Called when the Media Stream starts. */
+    onStreamStarted: (streamSid: string, callSid: string) => void;
+    /** Called when the Media Stream stops. */
+    onStreamStopped: () => void;
+    /** Optional: called on Twilio status callbacks. */
+    onStatusCallback?: (callSid: string, callStatus: string, answeredBy?: string) => void;
+}
+declare class TwilioWebhookServer {
+    private readonly config;
+    private httpServer;
+    private wss;
+    private activeWs;
+    constructor(config: TwilioWebhookServerConfig);
+    /** Start the HTTP + WebSocket server. */
+    start(): Promise<void>;
+    /** Stop the server and close all connections. */
+    stop(): Promise<void>;
+    /** Send mulaw audio to Twilio via the active Media Stream. */
+    sendMedia(mulawBase64: string, streamSid?: string): void;
+    private handleHttp;
+    private handleVoiceWebhook;
+    private handleStatusCallback;
+    private handleWsConnection;
+    private handleWsMessage;
+}
+
 /**
  * Bounded ring buffer for PCM audio chunks.
  * When the buffer exceeds its capacity, the oldest chunks are dropped first.
@@ -2004,6 +2597,96 @@ declare class AudioBuffer {
     clear(): void;
     get size(): number;
     get isEmpty(): boolean;
+}
+
+/** Configuration for the Cartesia TTS provider. */
+interface CartesiaTTSConfig {
+    /** Cartesia API key. Required. */
+    apiKey: string;
+    /** Cartesia voice ID. Required. */
+    voiceId: string;
+    /** Model identifier. Default: `'sonic-2'`. */
+    modelId?: string;
+    /** ISO 639-1 language code (e.g. `'en'`). Default: `'en'`. */
+    language?: string;
+    /** Speech speed control. Default: `'normal'`. */
+    speed?: 'slowest' | 'slow' | 'normal' | 'fast' | 'fastest' | number;
+    /** Emotion tags (e.g. `['cheerful', 'friendly']`). Default: `[]`. */
+    emotion?: string[];
+}
+/**
+ * Streaming TTS provider backed by the Cartesia WebSocket API.
+ *
+ * Each `requestId` from `synthesize()` maps to a unique Cartesia "context".
+ * Text is buffered at sentence boundaries via {@link SentenceBuffer} before
+ * being sent to the API. Audio chunks arrive as base64-encoded PCM and are
+ * delivered through the `onAudio` callback.
+ */
+declare class CartesiaTTSProvider implements TTSProvider {
+    private readonly _apiKey;
+    private readonly _voiceId;
+    private readonly _modelId;
+    private readonly _language;
+    private readonly _speed;
+    private readonly _emotion;
+    private _sampleRate;
+    private _state;
+    private _ws;
+    private _sentenceBuffer;
+    /** Current requestId being synthesized. */
+    private _currentRequestId;
+    /** Map from Cartesia context_id → requestId for audio/done correlation. */
+    private readonly _contextToRequest;
+    /** Set of requestIds that have been cancelled (to suppress late callbacks). */
+    private readonly _cancelledRequests;
+    /** Counter for generating unique context IDs within this session. */
+    private _contextCounter;
+    /** Current context ID (for the active requestId). */
+    private _currentContextId;
+    /** Whether the current context has been finalized (continue: false sent). */
+    private _contextFinalized;
+    private _connectResolve;
+    private _connectReject;
+    private _connectTimer?;
+    onAudio?: (base64Pcm: string, durationMs: number, requestId: number) => void;
+    onDone?: (requestId: number) => void;
+    onWordBoundary?: (word: string, offsetMs: number, requestId: number) => void;
+    onError?: (error: Error, fatal: boolean) => void;
+    constructor(config: CartesiaTTSConfig);
+    configure(preferred: TTSAudioConfig): TTSAudioConfig;
+    start(): Promise<void>;
+    stop(): Promise<void>;
+    synthesize(text: string, requestId: number, options?: {
+        flush?: boolean;
+    }): void;
+    cancel(): void;
+    private _connect;
+    private _handleMessage;
+    private _parseWordTimestamps;
+    private _handleClose;
+    private _sendTextChunk;
+    private _finalizeCurrentContext;
+    private _generateContextId;
+    private _send;
+    private _log;
+}
+
+/**
+ * Adapts a SessionClientSender (e.g. multi-user WebSocket) to the IClientChannel
+ * interface expected by VoiceSession. Used when the server owns the client connection
+ * and feeds input explicitly via feedAudioFromClient / feedJsonFromClient.
+ */
+declare class ClientSenderAdapter implements IClientChannel {
+    private readonly sender;
+    private readonly audioBuffer;
+    private _buffering;
+    constructor(sender: SessionClientSender);
+    start(): Promise<void>;
+    stop(): Promise<void>;
+    sendAudioToClient(data: Buffer): void;
+    sendJsonToClient(message: Record<string, unknown>): void;
+    startBuffering(): void;
+    stopBuffering(): Buffer[];
 }
 
 /** Configuration for the ElevenLabs Scribe v2 Realtime STT provider. */
@@ -2052,6 +2735,80 @@ declare class ElevenLabsSTTProvider implements STTProvider {
     private _scheduleReconnect;
     private _flushReconnectBuffer;
     private _bufferForReconnect;
+    private _send;
+    private _log;
+}
+
+/** Configuration for the ElevenLabs TTS streaming provider. */
+interface ElevenLabsTTSConfig {
+    /** ElevenLabs API key (xi-api-key). Required. */
+    apiKey: string;
+    /** ElevenLabs voice ID (preset or cloned). Required. */
+    voiceId: string;
+    /** Model identifier. Default: `'eleven_flash_v2_5'` (lowest latency). */
+    modelId?: string;
+    /** Voice stability (0.0-1.0). Default: `0.5`. */
+    stability?: number;
+    /** Voice similarity boost (0.0-1.0). Default: `0.75`. */
+    similarityBoost?: number;
+    /** Voice expressiveness / style (0.0-1.0). Default: `0.0`. */
+    style?: number;
+    /** Enhance voice clarity. Default: `true`. */
+    useSpeakerBoost?: boolean;
+    /** BCP-47 language code for multilingual models. */
+    languageCode?: string;
+}
+/**
+ * Streaming TTS provider backed by ElevenLabs WebSocket streaming API.
+ *
+ * Uses the `/v1/text-to-speech/{voice_id}/stream-input` endpoint to stream
+ * text in and receive base64-encoded PCM audio out. Text is buffered via
+ * {@link SentenceBuffer} and sent at sentence boundaries for natural prosody.
+ */
+declare class ElevenLabsTTSProvider implements TTSProvider {
+    private readonly _apiKey;
+    private readonly _voiceId;
+    private readonly _modelId;
+    private readonly _stability;
+    private readonly _similarityBoost;
+    private readonly _style;
+    private readonly _useSpeakerBoost;
+    private readonly _languageCode;
+    private _outputFormat;
+    private _sampleRate;
+    private _state;
+    private _ws;
+    private _sentenceBuffer;
+    /** Total characters sent to TTS but not yet acknowledged (pending synthesis). */
+    private _pendingChars;
+    private _currentRequestId;
+    /** Set of requestIds for which we've sent text but not yet received final audio. */
+    private _pendingRequestIds;
+    private _connectResolve;
+    private _connectReject;
+    private _connectTimer?;
+    onAudio?: (base64Pcm: string, durationMs: number, requestId: number) => void;
+    onDone?: (requestId: number) => void;
+    onWordBoundary?: (word: string, offsetMs: number, requestId: number) => void;
+    onError?: (error: Error, fatal: boolean) => void;
+    constructor(config: ElevenLabsTTSConfig);
+    configure(preferred: TTSAudioConfig): TTSAudioConfig;
+    start(): Promise<void>;
+    stop(): Promise<void>;
+    synthesize(text: string, requestId: number, options?: {
+        flush?: boolean;
+    }): void;
+    cancel(): void;
+    private _connect;
+    /** Send Beginning of Stream (BOS) message with voice settings. */
+    private _sendBOS;
+    private _sendText;
+    private _flushBuffer;
+    private _handleMessage;
+    private _processAlignment;
+    private _handleClose;
+    private _closeAndReconnect;
+    private _cleanup;
     private _send;
     private _log;
 }
@@ -2174,6 +2931,17 @@ declare class GeminiLiveTransport implements LLMTransport {
     private setupResolver;
     /** Tracks whether onModelTurnStart has already fired for the current turn. */
     private _modelTurnStarted;
+    /** Whether the transport should emit text output (used by external TTS pipelines). */
+    private _textMode;
+    /**
+     * True when text-mode is satisfied by output audio transcription instead of
+     * model text parts (native-audio model compatibility path).
+     */
+    private _textFromOutputTranscription;
+    /** Whether onTextDone has been fired for the current turn (prevents double-fire). */
+    private _textDoneFired;
+    /** Latest Gemini `usageMetadata` for the active model turn (cleared on `turnComplete`). */
+    private _cachedGeminiUsage;
     readonly capabilities: TransportCapabilities;
     readonly audioFormat: AudioFormatSpec;
     onAudioOutput?: (base64Data: string) => void;
@@ -2190,6 +2958,10 @@ declare class GeminiLiveTransport implements LLMTransport {
     onGoAway?: (timeLeft: string) => void;
     onResumptionUpdate?: (handle: string, resumable: boolean) => void;
     onGroundingMetadata?: (metadata: Record<string, unknown>) => void;
+    onTextOutput?: (text: string) => void;
+    onTextDone?: () => void;
+    onSpeechStarted?: () => void;
+    onRealtimeLLMUsage?: (usage: RealtimeLLMUsageEvent) => void;
     constructor(config: GeminiTransportConfig, callbacks: GeminiTransportCallbacks);
     /** Establish a WebSocket connection to the Gemini Live API.
      *  Resolves only after Gemini sends `setupComplete`, so callers can safely
@@ -2252,6 +3024,98 @@ declare class GeminiLiveTransport implements LLMTransport {
     private handleMessage;
 }
 
+/**
+ * Multi-Client Transport
+ *
+ * WebSocket server that handles multiple concurrent client connections.
+ * Routes messages to the correct VoiceSession based on connection mapping.
+ * Can run standalone (start) or attached to an HTTP server (attachToHttpServer).
+ */
+
+interface ConnectionContext {
+    webSocketId: string;
+    sessionId: string | null;
+    userId: string | null;
+    connectedAt: number;
+    lastActivityAt: number;
+    /** HTTP upgrade request (for auth to read URL query, e.g. ?userId=). */
+    request?: IncomingMessage;
+}
+interface MultiClientTransportCallbacks {
+    /** Called when a new WebSocket connection is established */
+    onConnection?(ws: WebSocket, context: ConnectionContext): void | Promise<void>;
+    /** Called when a WebSocket connection is closed */
+    onDisconnection?(ws: WebSocket, context: ConnectionContext): void | Promise<void>;
+    /** Called when binary audio data is received from a client */
+    onAudioFromClient?(ws: WebSocket, data: Buffer, context: ConnectionContext): void;
+    /** Called when a JSON message is received from a client */
+    onJsonFromClient?(ws: WebSocket, message: Record<string, unknown>, context: ConnectionContext): void;
+    /** Called when a WebSocket error occurs */
+    onError?(ws: WebSocket, error: Error, context: ConnectionContext): void;
+}
+/**
+ * WebSocket server that manages multiple concurrent client connections.
+ * Each connection can be associated with a VoiceSession.
+ */
+declare class MultiClientTransport {
+    private port;
+    private callbacks;
+    private host;
+    private wss;
+    private connections;
+    private connectionCounter;
+    constructor(port: number, callbacks: MultiClientTransportCallbacks, host?: string);
+    /**
+     * Start the WebSocket server on its own port (standalone).
+     */
+    start(): Promise<void>;
+    /**
+     * Attach to an existing HTTP server; handle WebSocket upgrade on the given path(s).
+     * Call this instead of start() when you serve HTTP (e.g. /api) and WS on the same port.
+     * Accepts both '/' and '/ws' so client works with same-origin (/) and reverse-proxy (/ws) setups.
+     */
+    attachToHttpServer(httpServer: Server, wsPaths?: string | string[]): void;
+    /**
+     * Stop the WebSocket server and close all connections.
+     */
+    stop(): Promise<void>;
+    /**
+     * Get connection context for a WebSocket.
+     */
+    getConnectionContext(ws: WebSocket): ConnectionContext | null;
+    /**
+     * Associate a session with a WebSocket connection.
+     */
+    associateSession(ws: WebSocket, sessionId: string): void;
+    /**
+     * Associate a user with a WebSocket connection.
+     */
+    associateUser(ws: WebSocket, userId: string): void;
+    /**
+     * Send audio data to a specific WebSocket connection.
+     */
+    sendAudioToClient(ws: WebSocket, data: Buffer): void;
+    /**
+     * Send a JSON message to a specific WebSocket connection.
+     */
+    sendJsonToClient(ws: WebSocket, message: Record<string, unknown>): void;
+    /**
+     * Broadcast a message to all connected clients.
+     */
+    broadcast(message: Record<string, unknown>): void;
+    /**
+     * Get statistics about active connections.
+     */
+    getStats(): {
+        totalConnections: number;
+        connectionsByUser: Record<string, number>;
+    };
+    /**
+     * Handle a new WebSocket connection.
+     */
+    private handleConnection;
+}
+
 /** Configuration for constructing an OpenAIRealtimeTransport. */
 interface OpenAIRealtimeConfig {
     /** OpenAI API key. */
@@ -2266,6 +3130,14 @@ interface OpenAIRealtimeConfig {
     turnDetection?: Record<string, unknown>;
     /** Noise reduction configuration. */
     noiseReduction?: Record<string, unknown>;
+    /**
+     * Realtime API protocol version. Default 'ga' uses the Aug 2025 GA shape
+     * (`type='realtime'`, nested `audio.input`/`audio.output`,
+     * `response.output_audio.delta`). Set 'legacy' for Azure OpenAI realtime
+     * preview endpoints — they still expect the pre-GA flat shape and emit
+     * legacy event names like `response.audio.delta`.
+     */
+    protocolVersion?: 'ga' | 'legacy';
 }
 /**
  * LLMTransport implementation for the OpenAI Realtime API.
@@ -2297,6 +3169,10 @@ declare class OpenAIRealtimeTransport implements LLMTransport {
     onGoAway?: (timeLeft: string) => void;
     onResumptionUpdate?: (handle: string, resumable: boolean) => void;
     onGroundingMetadata?: (metadata: Record<string, unknown>) => void;
+    onTextOutput?: (text: string) => void;
+    onTextDone?: () => void;
+    onSpeechStarted?: () => void;
+    onRealtimeLLMUsage?: (usage: RealtimeLLMUsageEvent) => void;
     private client;
     private rt;
     private _isConnected;
@@ -2306,9 +3182,11 @@ declare class OpenAIRealtimeTransport implements LLMTransport {
     private voice;
     private lastAssistantItemId;
     private audioOutputMs;
-    private pendingFunctionCalls;
-    private _isModelGenerating;
+    private functionCallAssembler;
+    private responseState;
     private _pendingWhenIdle;
+    private sessionSerializer;
+    private _textMode;
     private _suppressAudio;
     constructor(config: OpenAIRealtimeConfig);
     get isConnected(): boolean;
@@ -2319,7 +3197,7 @@ declare class OpenAIRealtimeTransport implements LLMTransport {
     commitAudio(): void;
     clearAudio(): void;
     updateSession(config: SessionUpdate): void;
-    transferSession(config: SessionUpdate, _state?: ReconnectState): Promise<void>;
+    transferSession(config: SessionUpdate, state?: ReconnectState): Promise<void>;
     sendContent(turns: ContentTurn[], turnComplete?: boolean): void;
     sendFile(base64Data: string, mimeType: string): void;
     sendToolResult(result: TransportToolResult): void;
@@ -2328,6 +3206,15 @@ declare class OpenAIRealtimeTransport implements LLMTransport {
     private rtSend;
     private applyTransportConfig;
     private buildSessionConfig;
+    /**
+     * Pre-GA / legacy session shape for Azure realtime preview endpoints.
+     * Flat structure: `input_audio_format`/`output_audio_format` at top
+     * level, `voice`/`turn_detection`/`input_audio_transcription` as siblings.
+     * Cast through `Record<string, unknown>` because the SDK's typed
+     * `RealtimeSessionCreateRequest` models GA only, and Azure rejects
+     * `type='realtime'` even when the SDK type passes locally.
+     */
+    private buildLegacySessionConfig;
     private wireEventListeners;
     /** Flush any tool results queued with 'when_idle' scheduling. */
     private flushPendingWhenIdle;
@@ -2362,4 +3249,4 @@ interface QueuedNotification {
     queuedAt: number;
 }
 
-export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CancelledError, type ClientMessage, ClientTransport, type ClientTransportCallbacks, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, type ReconnectState, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SendOrQueueOptions, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, type UIPayload, type UIResponse, type Unsubscribe, ValidationError, VoiceSession, type VoiceSessionConfig, createAgentContext, createAskUserTool, runSubagent, zodToJsonSchema };
+export { AUDIO_FORMAT, type AgentContext, AgentError, AgentRouter, type ArtifactRef, type ArtifactStore, AudioBuffer, type AudioFormat, type AudioFormatSpec, BackgroundNotificationQueue, type BehaviorCategory, type BehaviorPreset, CancelledError, type CartesiaTTSConfig, CartesiaTTSProvider, type ClientMessage, ClientSenderAdapter, type ConnectionContext, type ContentTurn, ConversationContext, type ConversationHistoryStore, ConversationHistoryWriter, type ConversationItem, type ConversationItemRole, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_EXTRACTION_TIMEOUT_MS, DEFAULT_RECONNECT_TIMEOUT_MS, DEFAULT_SUBAGENT_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS, DirectiveManager, type ElevenLabsSTTConfig, ElevenLabsSTTProvider, type ElevenLabsTTSConfig, ElevenLabsTTSProvider, type ErrorSeverity, EventBus, type EventHandler, type EventPayload, type EventPayloadMap, type EventSourceConfig, type EventType, type ExternalEvent, FrameworkError, type FrameworkHooks, type GeminiBatchSTTConfig, GeminiBatchSTTProvider, GeminiLiveTransport, type GeminiTransportCallbacks, type GeminiTransportConfig, HooksManager, type IClientChannel, type IEventBus, InMemorySessionStore, InputTimeoutError, InteractionModeManager, type InteractiveSubagentConfig, JsonMemoryStore, type LLMProvider, type LLMTransport, type LLMTransportConfig, type LLMTransportError, type MainAgent, MemoryCacheManager, type MemoryCategory, MemoryDistiller, type MemoryDistillerConfig, MemoryError, type MemoryFact, type MemoryStore, MultiClientTransport, type MultiClientTransportCallbacks, MultiUserSessionManager, type MultiUserSessionManagerConfig, type NotificationPriority, type OpenAIRealtimeConfig, OpenAIRealtimeTransport, type PaginationOptions, type PendingToolCall, type QueuedNotification, type RealtimeLLMUsageEvent, type RealtimeUsageKind, type RealtimeUsageModalityBreakdown, type RealtimeUsagePhase, type RealtimeUsageProvider, type RealtimeUsageUnit, type ReconnectState, type ReplayItem, type ResumptionState, type ResumptionUpdate, type RunSubagentOptions, type STTAudioConfig, type STTProvider, type SaveArtifactParams, type SendOrQueueOptions, type ServerConfig, type ServiceSubagentConfig, type SessionAnalytics, type SessionCheckpoint, type SessionClientSender, SessionCompletedError, type SessionConfig, SessionError, type SessionInteractionMode, SessionManager, type SessionMetadata, type SessionRecord, type SessionReport, type SessionState, type SessionStore, type SessionSummary, type SessionUpdate, type SubagentConfig, type SubagentContextSnapshot, type SubagentEventCallbacks, type SubagentMessage, type SubagentResult, type SubagentSession, SubagentSessionImpl, type SubagentSessionState, type SubagentTask, type TTSAudioConfig, type TTSProvider, type ToolCall, ToolCallRouter, type ToolCallRouterDeps, type ToolContext, type ToolDefinition, type ToolExecution, ToolExecutionError, ToolExecutor, type ToolResult, TranscriptManager, type TranscriptSink, type TransportAuth, type TransportCapabilities, TransportError, type TransportPendingToolCall, type TransportToolCall, type TransportToolResult, TwilioBridge, type TwilioBridgeCallbacks, type TwilioBridgeConfig, TwilioWebhookServer, type TwilioWebhookServerConfig, type UIPayload, type UIResponse, type Unsubscribe, ValidationError, VoiceSession, type VoiceSessionConfig, createAgentContext, createAskUserTool, decodeMulawToPcm, encodePcmToMulaw, frameworkToTwilio, loadConfig, mulawDecode, mulawEncode, resample, runSubagent, twilioToFramework, validateConfig, zodToJsonSchema };
