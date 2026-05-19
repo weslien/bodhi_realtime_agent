@@ -6800,6 +6800,7 @@ var OpenAIRealtimeTransport = class {
       this._textMode = config.responseModality === "text";
     }
     if (!this.rt || !this._isConnected) return;
+    const isLegacy = this.config.protocolVersion === "legacy";
     const update = {};
     if (config.instructions !== void 0) {
       update.instructions = config.instructions;
@@ -6808,12 +6809,17 @@ var OpenAIRealtimeTransport = class {
       update.tools = config.tools.map(toolToOpenAIFunction);
     }
     if (config.responseModality !== void 0) {
-      update.output_modalities = config.responseModality === "text" ? ["text"] : ["audio"];
+      if (isLegacy) {
+        update.modalities = config.responseModality === "text" ? ["text"] : ["audio", "text"];
+      } else {
+        update.output_modalities = config.responseModality === "text" ? ["text"] : ["audio"];
+      }
     }
     this.rtSend({ type: "session.update", session: update });
   }
   // --- Agent transfer (in-place via session.update — no reconnect needed) ---
   async transferSession(config, state) {
+    const isLegacy = this.config.protocolVersion === "legacy";
     const update = {};
     if (config.instructions !== void 0) {
       this.instructions = config.instructions;
@@ -6825,7 +6831,11 @@ var OpenAIRealtimeTransport = class {
     }
     if (config.responseModality !== void 0) {
       this._textMode = config.responseModality === "text";
-      update.output_modalities = config.responseModality === "text" ? ["text"] : ["audio"];
+      if (isLegacy) {
+        update.modalities = config.responseModality === "text" ? ["text"] : ["audio", "text"];
+      } else {
+        update.output_modalities = config.responseModality === "text" ? ["text"] : ["audio"];
+      }
     }
     if (!this.rt || !this._isConnected) {
       await this.connect();

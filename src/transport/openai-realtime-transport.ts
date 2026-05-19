@@ -290,25 +290,32 @@ export class OpenAIRealtimeTransport implements LLMTransport {
 
 		if (!this.rt || !this._isConnected) return;
 
-		const update: Partial<RealtimeSessionCreateRequest> = {};
+		const isLegacy = this.config.protocolVersion === 'legacy';
+		const update: Record<string, unknown> = {};
 		if (config.instructions !== undefined) {
 			update.instructions = config.instructions;
 		}
 		if (config.tools !== undefined) {
-			// biome-ignore lint/suspicious/noExplicitAny: SDK tools type is complex; our tool format is compatible at runtime
-			update.tools = config.tools.map(toolToOpenAIFunction) as any;
+			update.tools = config.tools.map(toolToOpenAIFunction);
 		}
 		if (config.responseModality !== undefined) {
-			update.output_modalities = config.responseModality === 'text' ? ['text'] : ['audio'];
+			// Legacy Azure preview uses `modalities` (with both audio+text in
+			// audio mode); GA uses `output_modalities`.
+			if (isLegacy) {
+				update.modalities = config.responseModality === 'text' ? ['text'] : ['audio', 'text'];
+			} else {
+				update.output_modalities = config.responseModality === 'text' ? ['text'] : ['audio'];
+			}
 		}
 
-		this.rtSend({ type: 'session.update', session: update as RealtimeSessionCreateRequest });
+		this.rtSend({ type: 'session.update', session: update as unknown as RealtimeSessionCreateRequest });
 	}
 
 	// --- Agent transfer (in-place via session.update — no reconnect needed) ---
 
 	async transferSession(config: SessionUpdate, state?: ReconnectState): Promise<void> {
-		const update: Partial<RealtimeSessionCreateRequest> = {};
+		const isLegacy = this.config.protocolVersion === 'legacy';
+		const update: Record<string, unknown> = {};
 
 		if (config.instructions !== undefined) {
 			this.instructions = config.instructions;
@@ -316,12 +323,15 @@ export class OpenAIRealtimeTransport implements LLMTransport {
 		}
 		if (config.tools !== undefined) {
 			this.tools = config.tools;
-			// biome-ignore lint/suspicious/noExplicitAny: SDK tools type is complex; our tool format is compatible at runtime
-			update.tools = config.tools.map(toolToOpenAIFunction) as any;
+			update.tools = config.tools.map(toolToOpenAIFunction);
 		}
 		if (config.responseModality !== undefined) {
 			this._textMode = config.responseModality === 'text';
-			update.output_modalities = config.responseModality === 'text' ? ['text'] : ['audio'];
+			if (isLegacy) {
+				update.modalities = config.responseModality === 'text' ? ['text'] : ['audio', 'text'];
+			} else {
+				update.output_modalities = config.responseModality === 'text' ? ['text'] : ['audio'];
+			}
 		}
 
 		if (!this.rt || !this._isConnected) {
@@ -344,7 +354,7 @@ export class OpenAIRealtimeTransport implements LLMTransport {
 		});
 
 		try {
-			this.rtSend({ type: 'session.update', session: update as RealtimeSessionCreateRequest });
+			this.rtSend({ type: 'session.update', session: update as unknown as RealtimeSessionCreateRequest });
 			await updatedPromise;
 			this.sessionSerializer.release();
 		} catch (error) {
