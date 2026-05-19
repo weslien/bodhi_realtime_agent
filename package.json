@@ -24,6 +24,7 @@
   ],
   "scripts": {
     "build": "tsup",
+    "prepare": "tsup --silent || true",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "biome check src/ test/",
